@@ -486,13 +486,8 @@ async def run_credit_assessment(
     metrics, missing_data = calculate_credit_metrics(application)
     if missing_data:
         return fail_closed_assessment(application, metrics, missing_data)
-    invalid_metrics = [metric.name for metric in metrics if metric.value is None]
-    if invalid_metrics:
-        logger.warning(
-            "Credit assessment skipped invalid metrics for case_id=%s: %s",
-            application.case_id,
-            ", ".join(invalid_metrics),
-        )
+    if any(metric.value is None for metric in metrics):
+        logger.warning("Credit assessment failed closed: invalid_financial_metrics")
         return fail_closed_assessment(
             application,
             metrics,

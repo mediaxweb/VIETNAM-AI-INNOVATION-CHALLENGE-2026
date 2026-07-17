@@ -574,11 +574,11 @@ def test_consistent_undetermined_draft_stays_fail_closed():
 def extreme_decimal_application():
     return LOAN_APPLICATION_ADAPTER.validate_python(
         {
-            "case_id": "PERSONAL-EXTREME",
+            "case_id": "SENTINEL-INVALID-METRIC-CASE",
             "loan_type": "personal",
             "requested_amount": "1",
             "term_months": 12,
-            "purpose": "Decimal boundary",
+            "purpose": "APPLICANT_SENTINEL_SECRET https://user:password@rag.example/mcp",
             "monthly_income": "1",
             "monthly_debt_payment": "1e999999",
         }
@@ -593,16 +593,35 @@ def test_extreme_decimal_metric_is_undefined_instead_of_raising():
     assert missing_data == []
 
 
-def test_runner_skips_executor_for_undefined_metric():
+def test_runner_skips_executor_for_undefined_metric(caplog):
+    application = extreme_decimal_application()
+
     async def executor_must_not_run(*args):
         raise AssertionError("executor should not run")
 
     result = asyncio.run(
         run_credit_assessment(
-            extreme_decimal_application(),
+            application,
             decision_executor=executor_must_not_run,
         )
     )
 
     assert result.risk_level == "undetermined"
     assert result.missing_data == ["invalid_financial_metrics"]
+    records = [record for record in caplog.records if record.name == "credit_agent"]
+    assert len(records) == 1
+    assert records[0].getMessage() == (
+        "Credit assessment failed closed: invalid_financial_metrics"
+    )
+    assert records[0].exc_info is None
+    assert records[0].exc_text is None
+    for sensitive_value in (
+        application.case_id,
+        application.purpose,
+        "APPLICANT_SENTINEL_SECRET",
+        "https://user:password@rag.example/mcp",
+        str(application.monthly_debt_payment),
+        "Calculation failed",
+        "Traceback",
+    ):
+        assert sensitive_value not in caplog.text
