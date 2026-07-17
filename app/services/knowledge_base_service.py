@@ -269,10 +269,9 @@ class KnowledgeBaseService:
         _configure_embed_model()
         embed_provider, embed_model = _embedding_details()
         logger.info(
-            "Retrieving chunks with embedding provider='%s' model='%s' collection='%s'",
+            "Retrieving chunks with embedding provider='%s' model='%s'",
             embed_provider,
             embed_model,
-            collection_name,
         )
         chroma_client = self._create_chroma_client()
         chroma_collection = chroma_client.get_or_create_collection(collection_name)

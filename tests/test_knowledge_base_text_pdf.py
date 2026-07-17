@@ -20,6 +20,16 @@ class _FakeReader:
         self.pages = pages
 
 
+class _EmptyCollection:
+    def count(self):
+        return 0
+
+
+class _FakeChromaClient:
+    def get_or_create_collection(self, _collection_name):
+        return _EmptyCollection()
+
+
 def test_pdf_has_extractable_text_when_sample_contains_text(monkeypatch):
     monkeypatch.setattr(
         knowledge_base_service,
@@ -114,4 +124,26 @@ def test_process_document_ingests_text_pdf(monkeypatch, tmp_path):
     assert result.collection_name == "qa_collection__user__user-123"
     assert captured["documents"] == ["document-page"]
     assert captured["source_description"] == str(pdf_path)
+
+
+def test_retrieve_chunks_does_not_log_user_scope(monkeypatch, caplog):
+    sensitive_user_id = "sentinel-sensitive-user"
+    monkeypatch.setattr(knowledge_base_service, "_configure_embed_model", lambda: None)
+    monkeypatch.setattr(
+        knowledge_base_service,
+        "_embedding_details",
+        lambda: ("openai", "test-embedding"),
+    )
+    monkeypatch.setattr(
+        KnowledgeBaseService,
+        "_create_chroma_client",
+        staticmethod(lambda: _FakeChromaClient()),
+    )
+    caplog.set_level("INFO", logger="address_logger")
+
+    with pytest.raises(ValueError, match="is empty"):
+        KnowledgeBaseService().retrieve_chunks("DTI policy", user_id=sensitive_user_id)
+
+    assert "provider='openai' model='test-embedding'" in caplog.text
+    assert sensitive_user_id not in caplog.text
 
