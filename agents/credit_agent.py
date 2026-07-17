@@ -3,21 +3,27 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import os
 from collections.abc import Awaitable, Callable
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, DecimalException, ROUND_HALF_UP
 from pathlib import Path
-from typing import Annotated, Literal, TypeAlias
+from typing import Annotated, Any, Literal, TypeAlias
 
 from agents import Agent, Runner
+from agents.items import ToolCallItem, ToolCallOutputItem
+from agents.lifecycle import RunHooksBase
 from agents.mcp import MCPServerStreamableHttp
-from pydantic import BaseModel, Field, TypeAdapter
+from agents.tool import FunctionTool, ToolOriginType, get_function_tool_origin
+from agents.tool_context import ToolContext
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 
 RATIO_QUANTUM = Decimal("0.0001")
 DEFAULT_RAG_MCP_URL = "http://127.0.0.1:8766/mcp"
 DEFAULT_MODEL = "gpt-5.4-mini"
 MetricName = Literal["dti", "ltv", "dscr", "debt_to_equity", "current_ratio"]
+logger = logging.getLogger(__name__)
 
 
 class PersonalLoanApplication(BaseModel):
@@ -78,16 +84,19 @@ def _ratio(
         return MetricResult(name=name, value=None, reason=f"Missing: {', '.join(missing)}"), missing
     assert numerator is not None
     assert denominator is not None
-    if denominator <= 0:
-        return (
-            MetricResult(
-                name=name,
-                value=None,
-                reason=f"{denominator_field} must be greater than 0",
-            ),
-            [],
-        )
-    value = (numerator / denominator).quantize(RATIO_QUANTUM, rounding=ROUND_HALF_UP)
+    try:
+        if denominator <= 0:
+            return (
+                MetricResult(
+                    name=name,
+                    value=None,
+                    reason=f"{denominator_field} must be greater than 0",
+                ),
+                [],
+            )
+        value = (numerator / denominator).quantize(RATIO_QUANTUM, rounding=ROUND_HALF_UP)
+    except DecimalException:
+        return MetricResult(name=name, value=None, reason="Calculation failed"), []
     return MetricResult(name=name, value=str(value)), []
 
 
@@ -158,6 +167,8 @@ Recommendation = Literal[
 
 
 class KnowledgeEvidence(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     source_id: str = Field(min_length=1)
     file_name: str = Field(min_length=1)
     page: str | None = None
@@ -176,6 +187,11 @@ class CreditDecisionDraft(BaseModel):
     findings: list[CreditFinding] = Field(default_factory=list)
     missing_data: list[str] = Field(default_factory=list)
     evidence: list[KnowledgeEvidence] = Field(default_factory=list)
+
+
+class CreditDecisionExecution(BaseModel):
+    draft: CreditDecisionDraft
+    trusted_evidence: list[KnowledgeEvidence]
 
 
 class CreditAssessment(BaseModel):
@@ -211,22 +227,37 @@ def assemble_credit_assessment(
     metrics: list[MetricResult],
     missing_data: list[str],
     draft: CreditDecisionDraft,
+    trusted_evidence: list[KnowledgeEvidence],
 ) -> CreditAssessment:
-    combined_missing_data = sorted(set([*missing_data, *draft.missing_data]))
-    if combined_missing_data:
-        return fail_closed_assessment(application, metrics, combined_missing_data)
-    if not draft.evidence:
+    if not trusted_evidence:
         return fail_closed_assessment(application, metrics, ["rag_evidence"])
 
-    available_ids = {item.source_id for item in draft.evidence}
+    trusted_by_id = _evidence_by_id(trusted_evidence)
+    draft_by_id = _evidence_by_id(draft.evidence)
+    for source_id, item in draft_by_id.items():
+        if trusted_by_id.get(source_id) != item:
+            raise ValueError(f"Untrusted model evidence: {source_id}")
+
     referenced_ids = {
         evidence_id
         for finding in draft.findings
         for evidence_id in finding.evidence_ids
     }
-    unknown_ids = sorted(referenced_ids - available_ids)
+    unknown_ids = sorted(referenced_ids - trusted_by_id.keys())
     if unknown_ids:
         raise ValueError(f"Unknown evidence ids: {', '.join(unknown_ids)}")
+
+    if draft.risk_level == "undetermined":
+        if draft.recommendation != "request_more_information" or draft.findings:
+            raise ValueError("Contradictory undetermined credit decision")
+    elif draft.recommendation == "request_more_information" or not draft.findings:
+        raise ValueError("Contradictory determinate credit decision")
+
+    combined_missing_data = sorted(set([*missing_data, *draft.missing_data]))
+    if combined_missing_data:
+        return fail_closed_assessment(application, metrics, combined_missing_data)
+    if draft.risk_level == "undetermined":
+        return fail_closed_assessment(application, metrics, ["agent_undetermined"])
 
     return CreditAssessment(
         case_id=application.case_id,
@@ -236,14 +267,142 @@ def assemble_credit_assessment(
         metrics=metrics,
         findings=draft.findings,
         missing_data=[],
-        evidence=draft.evidence,
+        evidence=trusted_evidence,
     )
 
 
 DecisionExecutor: TypeAlias = Callable[
     [LoanApplication, list[MetricResult], str, str],
-    Awaitable[CreditDecisionDraft],
+    Awaitable[CreditDecisionExecution],
 ]
+
+
+def _evidence_by_id(
+    evidence: list[KnowledgeEvidence],
+) -> dict[str, KnowledgeEvidence]:
+    by_id: dict[str, KnowledgeEvidence] = {}
+    for item in evidence:
+        if item.source_id in by_id:
+            raise ValueError(f"Duplicate evidence source_id: {item.source_id}")
+        by_id[item.source_id] = item
+    return by_id
+
+
+def validate_search_knowledge_call(tool_name: str, raw_arguments: str) -> dict[str, Any]:
+    if tool_name != "search_knowledge":
+        raise ValueError("Only search_knowledge may be invoked")
+    try:
+        arguments = json.loads(raw_arguments)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise ValueError("search_knowledge arguments must be valid JSON") from error
+    if not isinstance(arguments, dict) or set(arguments) != {"domain", "query", "top_k"}:
+        raise ValueError("search_knowledge requires exactly domain, query, and top_k")
+    if arguments["domain"] != "credit":
+        raise ValueError("search_knowledge domain must be credit")
+    if not isinstance(arguments["query"], str) or not arguments["query"].strip():
+        raise ValueError("search_knowledge query must be a non-empty string")
+    if type(arguments["top_k"]) is not int or arguments["top_k"] != 5:
+        raise ValueError("search_knowledge top_k must be 5")
+    return arguments
+
+
+class CreditRAGRunHooks(RunHooksBase):
+    async def on_tool_start(self, context, agent, tool) -> None:
+        if not isinstance(context, ToolContext):
+            raise ValueError("Credit Agent tool calls require ToolContext")
+        validate_search_knowledge_call(context.tool_name, context.tool_arguments)
+        if not isinstance(tool, FunctionTool):
+            raise ValueError("Credit Agent may only invoke the credit-rag MCP tool")
+        origin = get_function_tool_origin(tool)
+        if (
+            origin is None
+            or origin.type != ToolOriginType.MCP
+            or origin.mcp_server_name != "credit-rag"
+        ):
+            raise ValueError("Credit Agent may only invoke the credit-rag MCP tool")
+
+
+def _parse_evidence_output(output: Any) -> list[KnowledgeEvidence]:
+    payload = output
+    if isinstance(payload, dict) and payload.get("type") == "text":
+        payload = payload.get("text")
+    elif (
+        isinstance(payload, list)
+        and len(payload) == 1
+        and isinstance(payload[0], dict)
+        and payload[0].get("type") == "text"
+    ):
+        payload = payload[0].get("text")
+
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except json.JSONDecodeError as error:
+            raise ValueError("search_knowledge returned invalid JSON") from error
+    if isinstance(payload, dict):
+        if set(payload) != {"evidence"}:
+            raise ValueError("search_knowledge output envelope must contain only evidence")
+        payload = payload["evidence"]
+    if not isinstance(payload, list):
+        raise ValueError("search_knowledge output must be an evidence list")
+
+    evidence = TypeAdapter(list[KnowledgeEvidence]).validate_python(payload)
+    _evidence_by_id(evidence)
+    return evidence
+
+
+def _require_credit_rag_origin(item: ToolCallItem | ToolCallOutputItem) -> None:
+    origin = item.tool_origin
+    if (
+        origin is None
+        or origin.type != ToolOriginType.MCP
+        or origin.mcp_server_name != "credit-rag"
+    ):
+        raise ValueError("Tool item did not originate from credit-rag MCP")
+
+
+def extract_trusted_evidence(new_items: list[Any]) -> list[KnowledgeEvidence]:
+    calls: dict[str, ToolCallItem] = {}
+    outputs: dict[str, ToolCallOutputItem] = {}
+    for item in new_items:
+        if isinstance(item, ToolCallItem):
+            _require_credit_rag_origin(item)
+            call_id = item.call_id
+            raw_arguments = (
+                item.raw_item.get("arguments")
+                if isinstance(item.raw_item, dict)
+                else getattr(item.raw_item, "arguments", None)
+            )
+            if not call_id or not isinstance(raw_arguments, str):
+                raise ValueError("credit-rag tool call is missing its call ID or arguments")
+            if call_id in calls:
+                raise ValueError(f"Duplicate credit-rag call ID: {call_id}")
+            validate_search_knowledge_call(item.tool_name or "", raw_arguments)
+            calls[call_id] = item
+        elif isinstance(item, ToolCallOutputItem):
+            _require_credit_rag_origin(item)
+            call_id = item.call_id
+            if not call_id:
+                raise ValueError("credit-rag tool output is missing its call ID")
+            if call_id in outputs:
+                raise ValueError(f"Duplicate credit-rag output ID: {call_id}")
+            outputs[call_id] = item
+
+    if not calls:
+        raise ValueError("No credit-rag search_knowledge call found")
+
+    trusted_evidence: list[KnowledgeEvidence] = []
+    for call_id in calls:
+        output = outputs.get(call_id)
+        if output is None:
+            raise ValueError(f"Missing credit-rag output for call: {call_id}")
+        trusted_evidence.extend(_parse_evidence_output(output.output))
+    if set(outputs) != set(calls):
+        raise ValueError("credit-rag output does not match a tool call")
+    if not trusted_evidence:
+        raise ValueError("credit-rag returned no evidence")
+    _evidence_by_id(trusted_evidence)
+    return trusted_evidence
 
 
 def build_credit_agent(server: MCPServerStreamableHttp, model: str) -> Agent:
@@ -277,32 +436,44 @@ def build_agent_input(
     )
 
 
+def build_mcp_server(mcp_url: str) -> MCPServerStreamableHttp:
+    return MCPServerStreamableHttp(
+        params={
+            "url": mcp_url,
+            "timeout": 30,
+            "sse_read_timeout": 30,
+        },
+        name="credit-rag",
+        cache_tools_list=True,
+        client_session_timeout_seconds=30,
+        tool_filter={"allowed_tool_names": ["search_knowledge"]},
+        use_structured_content=True,
+    )
+
+
 async def execute_credit_decision(
     application: LoanApplication,
     metrics: list[MetricResult],
     mcp_url: str,
     model: str,
-) -> CreditDecisionDraft:
-    params = {
-        "url": mcp_url,
-        "timeout": 30,
-        "sse_read_timeout": 30,
-    }
-    async with MCPServerStreamableHttp(
-        params=params,
-        name="credit-rag",
-        cache_tools_list=True,
-        client_session_timeout_seconds=30,
-    ) as server:
+) -> CreditDecisionExecution:
+    async with build_mcp_server(mcp_url) as server:
         tools = await server.list_tools()
-        if "search_knowledge" not in {tool.name for tool in tools}:
-            raise RuntimeError("RAG MCP server does not expose search_knowledge")
+        if {tool.name for tool in tools} != {"search_knowledge"}:
+            raise RuntimeError("RAG MCP server must expose only search_knowledge")
         agent = build_credit_agent(server, model)
-        result = await Runner.run(agent, build_agent_input(application, metrics))
+        result = await Runner.run(
+            agent,
+            build_agent_input(application, metrics),
+            hooks=CreditRAGRunHooks(),
+        )
 
     if not isinstance(result.final_output, CreditDecisionDraft):
         raise TypeError("Credit Agent returned an invalid structured output")
-    return result.final_output
+    return CreditDecisionExecution(
+        draft=result.final_output,
+        trusted_evidence=extract_trusted_evidence(result.new_items),
+    )
 
 
 async def run_credit_assessment(
@@ -315,12 +486,34 @@ async def run_credit_assessment(
     metrics, missing_data = calculate_credit_metrics(application)
     if missing_data:
         return fail_closed_assessment(application, metrics, missing_data)
+    invalid_metrics = [metric.name for metric in metrics if metric.value is None]
+    if invalid_metrics:
+        logger.warning(
+            "Credit assessment skipped invalid metrics for case_id=%s: %s",
+            application.case_id,
+            ", ".join(invalid_metrics),
+        )
+        return fail_closed_assessment(
+            application,
+            metrics,
+            ["invalid_financial_metrics"],
+        )
 
     executor = decision_executor or execute_credit_decision
     try:
-        draft = await executor(application, metrics, mcp_url, model)
-        return assemble_credit_assessment(application, metrics, [], draft)
+        execution = await executor(application, metrics, mcp_url, model)
+        return assemble_credit_assessment(
+            application,
+            metrics,
+            [],
+            execution.draft,
+            execution.trusted_evidence,
+        )
     except Exception:
+        logger.exception(
+            "Credit assessment runtime/provenance failure for case_id=%s",
+            application.case_id,
+        )
         return fail_closed_assessment(
             application,
             metrics,

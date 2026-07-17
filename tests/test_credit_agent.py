@@ -1,17 +1,28 @@
 import asyncio
+import json
 
 import pytest
+from agents import Agent
+from agents.items import ToolCallItem, ToolCallOutputItem
+from agents.tool import ToolOrigin, ToolOriginType
+from agents.tool_context import ToolContext
+from openai.types.responses import ResponseFunctionToolCall
 from pydantic import ValidationError
 
 from credit_agent import (
+    CreditDecisionExecution,
     LOAN_APPLICATION_ADAPTER,
+    CreditRAGRunHooks,
     CreditDecisionDraft,
     CreditFinding,
     KnowledgeEvidence,
     assemble_credit_assessment,
+    build_mcp_server,
     calculate_credit_metrics,
+    extract_trusted_evidence,
     fail_closed_assessment,
     run_credit_assessment,
+    validate_search_knowledge_call,
 )
 
 
@@ -163,11 +174,64 @@ def valid_draft():
     )
 
 
+def valid_execution(draft=None):
+    trusted_evidence = valid_draft().evidence
+    return CreditDecisionExecution(
+        draft=draft or valid_draft(),
+        trusted_evidence=trusted_evidence,
+    )
+
+
+def rag_run_items(
+    *,
+    arguments=None,
+    output=None,
+    origin=None,
+):
+    agent = Agent(name="Test Agent")
+    tool_origin = origin or ToolOrigin(
+        type=ToolOriginType.MCP,
+        mcp_server_name="credit-rag",
+    )
+    call = ToolCallItem(
+        agent=agent,
+        raw_item=ResponseFunctionToolCall(
+            arguments=json.dumps(
+                arguments
+                or {"domain": "credit", "query": "personal loan DTI", "top_k": 5}
+            ),
+            call_id="call-1",
+            name="search_knowledge",
+            type="function_call",
+        ),
+        tool_origin=tool_origin,
+    )
+    evidence_payload = [item.model_dump(mode="json") for item in valid_draft().evidence]
+    tool_output = ToolCallOutputItem(
+        agent=agent,
+        raw_item={"type": "function_call_output", "call_id": "call-1"},
+        output=(
+            output
+            if output is not None
+            else {"type": "text", "text": json.dumps({"evidence": evidence_payload})}
+        ),
+        tool_origin=tool_origin,
+    )
+    return [call, tool_output]
+
+
 def test_assessment_keeps_deterministic_metrics_and_valid_sources():
     application = personal_application()
     metrics, missing_data = calculate_credit_metrics(application)
+    draft = valid_draft()
 
-    result = assemble_credit_assessment(application, metrics, missing_data, valid_draft())
+    result = assemble_credit_assessment(
+        application,
+        metrics,
+        missing_data,
+        draft,
+        draft.evidence,
+    )
 
     assert result.case_id == "PERSONAL-001"
     assert result.risk_level == "low"
@@ -182,10 +246,17 @@ def test_unknown_evidence_reference_is_rejected():
     application = personal_application()
     metrics, missing_data = calculate_credit_metrics(application)
     draft = valid_draft()
+    trusted_evidence = valid_draft().evidence
     draft.findings[0].evidence_ids = ["missing-source"]
 
     with pytest.raises(ValueError, match="Unknown evidence ids: missing-source"):
-        assemble_credit_assessment(application, metrics, missing_data, draft)
+        assemble_credit_assessment(
+            application,
+            metrics,
+            missing_data,
+            draft,
+            trusted_evidence,
+        )
 
 
 def test_empty_rag_evidence_fails_closed():
@@ -195,7 +266,13 @@ def test_empty_rag_evidence_fails_closed():
     draft.evidence = []
     draft.findings = []
 
-    result = assemble_credit_assessment(application, metrics, missing_data, draft)
+    result = assemble_credit_assessment(
+        application,
+        metrics,
+        missing_data,
+        draft,
+        [],
+    )
 
     assert result.risk_level == "undetermined"
     assert result.recommendation == "request_more_information"
@@ -228,7 +305,7 @@ def test_runner_uses_executor_and_returns_assessment():
 
     async def fake_executor(received_application, metrics, mcp_url, model):
         calls.append((received_application.case_id, mcp_url, model))
-        return valid_draft()
+        return valid_execution()
 
     result = asyncio.run(
         run_credit_assessment(
@@ -266,7 +343,7 @@ def test_runner_skips_executor_when_required_financial_data_is_missing():
     assert result.missing_data == ["monthly_income"]
 
 
-def test_runner_fails_closed_when_runtime_raises():
+def test_runner_fails_closed_when_runtime_raises(caplog):
     application = personal_application()
 
     async def failing_executor(*args):
@@ -279,3 +356,235 @@ def test_runner_fails_closed_when_runtime_raises():
     assert result.risk_level == "undetermined"
     assert result.recommendation == "request_more_information"
     assert result.missing_data == ["rag_or_agent_runtime"]
+    assert "Credit assessment runtime/provenance failure" in caplog.text
+
+
+def test_mcp_server_allowlist_exposes_only_search_knowledge():
+    server = build_mcp_server("http://rag.test/mcp")
+
+    assert server.tool_filter == {"allowed_tool_names": ["search_knowledge"]}
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "arguments"),
+    [
+        ("delete_loan", {"domain": "credit", "query": "DTI", "top_k": 5}),
+        ("search_knowledge", {"domain": "hr", "query": "DTI", "top_k": 5}),
+        ("search_knowledge", {"domain": "credit", "query": "DTI"}),
+        ("search_knowledge", {"domain": "credit", "query": "DTI", "top_k": 4}),
+        ("search_knowledge", {"domain": "credit", "query": "  ", "top_k": 5}),
+        (
+            "search_knowledge",
+            {"domain": "credit", "query": "DTI", "top_k": 5, "extra": True},
+        ),
+    ],
+)
+def test_search_knowledge_contract_rejects_invalid_calls(tool_name, arguments):
+    with pytest.raises(ValueError):
+        validate_search_knowledge_call(tool_name, json.dumps(arguments))
+
+
+def test_search_knowledge_contract_accepts_exact_arguments():
+    validate_search_knowledge_call(
+        "search_knowledge",
+        json.dumps({"domain": "credit", "query": "DTI policy", "top_k": 5}),
+    )
+
+
+def test_run_hook_validates_arguments_before_tool_invocation():
+    context = ToolContext(
+        None,
+        tool_name="search_knowledge",
+        tool_call_id="call-1",
+        tool_arguments=json.dumps({"domain": "credit", "query": "DTI", "top_k": 4}),
+    )
+
+    with pytest.raises(ValueError):
+        asyncio.run(CreditRAGRunHooks().on_tool_start(context, Agent(name="test"), object()))
+
+
+def test_extracts_trusted_evidence_from_credit_rag_call_and_output():
+    evidence = extract_trusted_evidence(rag_run_items())
+
+    assert evidence == valid_draft().evidence
+
+
+def test_extracts_trusted_evidence_from_direct_list_output():
+    payload = [item.model_dump(mode="json") for item in valid_draft().evidence]
+
+    evidence = extract_trusted_evidence(rag_run_items(output=json.dumps(payload)))
+
+    assert evidence == valid_draft().evidence
+
+
+def test_evidence_extraction_rejects_missing_call():
+    items = rag_run_items()
+
+    with pytest.raises(ValueError, match="call"):
+        extract_trusted_evidence([items[1]])
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        ToolOrigin(type=ToolOriginType.FUNCTION),
+        ToolOrigin(type=ToolOriginType.MCP, mcp_server_name="other-rag"),
+    ],
+)
+def test_evidence_extraction_rejects_non_credit_rag_origin(origin):
+    with pytest.raises(ValueError, match="credit-rag"):
+        extract_trusted_evidence(rag_run_items(origin=origin))
+
+
+def test_evidence_extraction_rejects_invalid_arguments():
+    items = rag_run_items(
+        arguments={"domain": "credit", "query": "DTI", "top_k": 4},
+    )
+
+    with pytest.raises(ValueError):
+        extract_trusted_evidence(items)
+
+
+def test_evidence_extraction_rejects_malformed_output():
+    with pytest.raises(ValueError):
+        extract_trusted_evidence(rag_run_items(output="not json"))
+
+
+def test_evidence_extraction_rejects_conflicting_source_ids():
+    evidence = valid_draft().evidence[0].model_dump(mode="json")
+    conflicting = {**evidence, "excerpt": "Altered excerpt"}
+
+    with pytest.raises(ValueError, match="Duplicate evidence source_id"):
+        extract_trusted_evidence(rag_run_items(output=json.dumps([evidence, conflicting])))
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("source_id", "fabricated-source"),
+        ("excerpt", "Altered excerpt"),
+    ],
+)
+def test_runner_fails_closed_for_fabricated_or_altered_model_evidence(field_name, value):
+    draft = valid_draft()
+    setattr(draft.evidence[0], field_name, value)
+
+    async def fake_executor(*args):
+        return valid_execution(draft)
+
+    result = asyncio.run(
+        run_credit_assessment(personal_application(), decision_executor=fake_executor)
+    )
+
+    assert result.risk_level == "undetermined"
+    assert result.missing_data == ["rag_or_agent_runtime"]
+
+
+def test_runner_fails_closed_for_finding_without_trusted_evidence():
+    draft = valid_draft()
+    draft.findings[0].evidence_ids = ["fabricated-source"]
+
+    async def fake_executor(*args):
+        return valid_execution(draft)
+
+    result = asyncio.run(
+        run_credit_assessment(personal_application(), decision_executor=fake_executor)
+    )
+
+    assert result.risk_level == "undetermined"
+    assert result.missing_data == ["rag_or_agent_runtime"]
+
+
+@pytest.mark.parametrize(
+    "draft",
+    [
+        CreditDecisionDraft(
+            risk_level="undetermined",
+            recommendation="proceed_to_manual_review",
+        ),
+        CreditDecisionDraft(
+            risk_level="undetermined",
+            recommendation="request_more_information",
+            findings=valid_draft().findings,
+            evidence=valid_draft().evidence,
+        ),
+        CreditDecisionDraft(
+            risk_level="low",
+            recommendation="request_more_information",
+            findings=valid_draft().findings,
+            evidence=valid_draft().evidence,
+        ),
+        CreditDecisionDraft(
+            risk_level="low",
+            recommendation="proceed_to_manual_review",
+            evidence=valid_draft().evidence,
+        ),
+    ],
+)
+def test_runner_fails_closed_for_contradictory_draft(draft):
+    async def fake_executor(*args):
+        return valid_execution(draft)
+
+    result = asyncio.run(
+        run_credit_assessment(personal_application(), decision_executor=fake_executor)
+    )
+
+    assert result.risk_level == "undetermined"
+    assert result.missing_data == ["rag_or_agent_runtime"]
+
+
+def test_consistent_undetermined_draft_stays_fail_closed():
+    application = personal_application()
+    metrics, missing_data = calculate_credit_metrics(application)
+    draft = CreditDecisionDraft(
+        risk_level="undetermined",
+        recommendation="request_more_information",
+    )
+
+    result = assemble_credit_assessment(
+        application,
+        metrics,
+        missing_data,
+        draft,
+        valid_draft().evidence,
+    )
+
+    assert result.risk_level == "undetermined"
+    assert result.missing_data == ["agent_undetermined"]
+
+
+def extreme_decimal_application():
+    return LOAN_APPLICATION_ADAPTER.validate_python(
+        {
+            "case_id": "PERSONAL-EXTREME",
+            "loan_type": "personal",
+            "requested_amount": "1",
+            "term_months": 12,
+            "purpose": "Decimal boundary",
+            "monthly_income": "1",
+            "monthly_debt_payment": "1e999999",
+        }
+    )
+
+
+def test_extreme_decimal_metric_is_undefined_instead_of_raising():
+    metrics, missing_data = calculate_credit_metrics(extreme_decimal_application())
+
+    assert metrics[0].value is None
+    assert metrics[0].reason == "Calculation failed"
+    assert missing_data == []
+
+
+def test_runner_skips_executor_for_undefined_metric():
+    async def executor_must_not_run(*args):
+        raise AssertionError("executor should not run")
+
+    result = asyncio.run(
+        run_credit_assessment(
+            extreme_decimal_application(),
+            decision_executor=executor_must_not_run,
+        )
+    )
+
+    assert result.risk_level == "undetermined"
+    assert result.missing_data == ["invalid_financial_metrics"]
