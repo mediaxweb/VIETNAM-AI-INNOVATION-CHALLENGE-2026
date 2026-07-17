@@ -23,6 +23,7 @@ from credit_agent import (
     fail_closed_assessment,
     run_credit_assessment,
     validate_document_page_call,
+    validate_loan_data_call,
     validate_search_knowledge_call,
 )
 
@@ -49,6 +50,23 @@ def test_personal_application_metrics():
 
     assert metric_map(metrics) == {"dti": "0.3000", "ltv": "0.8000"}
     assert missing_data == []
+
+
+def test_application_accepts_optional_persisted_loan_profile_id():
+    application = LOAN_APPLICATION_ADAPTER.validate_python(
+        {
+            "case_id": "PERSONAL-API-001",
+            "loan_profile_id": "507f1f77bcf86cd799439011",
+            "loan_type": "personal",
+            "requested_amount": "100000000",
+            "term_months": 12,
+            "purpose": "Tiêu dùng",
+            "monthly_income": "20000000",
+            "monthly_debt_payment": "2000000",
+        }
+    )
+
+    assert application.loan_profile_id == "507f1f77bcf86cd799439011"
 
 
 def test_sme_application_metrics():
@@ -398,11 +416,17 @@ def test_runner_fails_closed_when_runtime_raises(caplog):
         assert sensitive_value not in caplog.text
 
 
-def test_mcp_server_allowlist_exposes_search_and_document_page():
+def test_mcp_server_allowlist_exposes_credit_read_tools():
     server = build_mcp_server("http://rag.test/mcp")
 
     assert server.tool_filter == {
-        "allowed_tool_names": ["search_knowledge", "get_document_page"]
+        "allowed_tool_names": [
+            "search_knowledge",
+            "get_document_page",
+            "get_loan_profile",
+            "get_customer",
+            "list_reports",
+        ]
     }
 
 
@@ -453,6 +477,32 @@ def test_document_page_contract_accepts_exact_arguments():
     ) == {"domain": "credit", "source_id": "credit-policy-1"}
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "arguments"),
+    [
+        ("get_loan_profile", {"loan_profile_id": "profile-1"}),
+        ("get_customer", {"customer_id": "customer-1"}),
+        ("list_reports", {"loan_profile_id": "profile-1"}),
+    ],
+)
+def test_loan_data_contract_accepts_read_tools(tool_name, arguments):
+    assert validate_loan_data_call(tool_name, json.dumps(arguments)) == arguments
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "arguments"),
+    [
+        ("update_customer", {"customer_id": "customer-1"}),
+        ("get_customer", {"customer_id": "  "}),
+        ("get_loan_profile", {"loan_profile_id": "profile-1", "extra": True}),
+        ("list_reports", {}),
+    ],
+)
+def test_loan_data_contract_rejects_write_or_invalid_calls(tool_name, arguments):
+    with pytest.raises(ValueError):
+        validate_loan_data_call(tool_name, json.dumps(arguments))
+
+
 def test_run_hook_validates_arguments_before_tool_invocation():
     context = ToolContext(
         None,
@@ -475,6 +525,20 @@ def test_extracts_trusted_evidence_from_direct_list_output():
     payload = [item.model_dump(mode="json") for item in valid_draft().evidence]
 
     evidence = extract_trusted_evidence(rag_run_items(output=json.dumps(payload)))
+
+    assert evidence == valid_draft().evidence
+
+
+def test_loan_data_call_is_allowed_but_not_treated_as_policy_evidence():
+    evidence = extract_trusted_evidence(
+        rag_run_items(
+            tool_name="get_loan_profile",
+            call_id="call-profile",
+            arguments={"loan_profile_id": "profile-1"},
+            output={"id": "profile-1", "customer_id": "customer-1"},
+        )
+        + rag_run_items(call_id="call-search")
+    )
 
     assert evidence == valid_draft().evidence
 

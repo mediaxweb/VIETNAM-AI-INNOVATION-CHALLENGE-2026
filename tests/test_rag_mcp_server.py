@@ -46,6 +46,30 @@ class FakeKnowledgeBaseService:
         return self.page_result
 
 
+class FakeLoanAgentService:
+    def __init__(self, error=None):
+        self.error = error
+        self.calls = []
+
+    async def get_loan_profile(self, *, user_id, loan_profile_id):
+        self.calls.append(("get_loan_profile", user_id, loan_profile_id))
+        if self.error:
+            raise self.error
+        return SimpleNamespace(id=loan_profile_id, customer_id="customer-1")
+
+    async def get_customer(self, *, user_id, customer_id):
+        self.calls.append(("get_customer", user_id, customer_id))
+        if self.error:
+            raise self.error
+        return SimpleNamespace(id=customer_id, full_name="Customer")
+
+    async def list_reports(self, *, user_id, loan_profile_id):
+        self.calls.append(("list_reports", user_id, loan_profile_id))
+        if self.error:
+            raise self.error
+        return SimpleNamespace(total_count=0, reports=[])
+
+
 def chunk(index, *, window=None, text=None):
     return {
         "chunk_id": f"source-{index}",
@@ -267,12 +291,15 @@ def test_document_page_rejects_a_different_page_from_rag():
         )
 
 
-def test_fastmcp_exposes_search_and_document_page_tools():
+def test_fastmcp_exposes_five_credit_read_tools():
     tools = asyncio.run(rag_mcp_server.mcp.list_tools())
 
     assert [tool.name for tool in tools] == [
         "search_knowledge",
         "get_document_page",
+        "get_loan_profile",
+        "get_customer",
+        "list_reports",
     ]
 
 
@@ -317,3 +344,40 @@ def test_fastmcp_page_tool_reads_user_scope_from_environment(monkeypatch):
     assert service.page_calls == [
         ("policy.pdf", "2", "credit-policy-user")
     ]
+
+
+def test_loan_data_tools_read_server_user_scope(monkeypatch):
+    service = FakeLoanAgentService()
+    monkeypatch.setattr(rag_mcp_server, "loan_agent_service", service)
+    monkeypatch.setenv("LOAN_AGENT_MCP_USER_ID", "loan-user")
+
+    profile = asyncio.run(rag_mcp_server.get_loan_profile(" profile-1 "))
+    customer = asyncio.run(rag_mcp_server.get_customer(" customer-1 "))
+    reports = asyncio.run(rag_mcp_server.list_reports(" profile-1 "))
+
+    assert profile.id == "profile-1"
+    assert customer.id == "customer-1"
+    assert reports.total_count == 0
+    assert service.calls == [
+        ("get_loan_profile", "loan-user", "profile-1"),
+        ("get_customer", "loan-user", "customer-1"),
+        ("list_reports", "loan-user", "profile-1"),
+    ]
+
+
+def test_loan_data_tool_fails_without_user_scope(monkeypatch):
+    monkeypatch.delenv("LOAN_AGENT_MCP_USER_ID", raising=False)
+
+    with pytest.raises(ValueError, match="LOAN_AGENT_MCP_USER_ID"):
+        asyncio.run(rag_mcp_server.get_loan_profile("profile-1"))
+
+
+def test_loan_data_tool_redacts_service_error(monkeypatch):
+    service = FakeLoanAgentService(error=RuntimeError("secret database detail"))
+    monkeypatch.setattr(rag_mcp_server, "loan_agent_service", service)
+    monkeypatch.setenv("LOAN_AGENT_MCP_USER_ID", "loan-user")
+
+    with pytest.raises(RuntimeError) as error:
+        asyncio.run(rag_mcp_server.get_loan_profile("profile-1"))
+
+    assert str(error.value) == "Loan profile retrieval failed"

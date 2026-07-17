@@ -22,12 +22,20 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 RATIO_QUANTUM = Decimal("0.0001")
 DEFAULT_RAG_MCP_URL = "http://127.0.0.1:8766/mcp"
 DEFAULT_MODEL = "gpt-5.4-mini"
+CREDIT_MCP_TOOL_NAMES = [
+    "search_knowledge",
+    "get_document_page",
+    "get_loan_profile",
+    "get_customer",
+    "list_reports",
+]
 MetricName = Literal["dti", "ltv", "dscr", "debt_to_equity", "current_ratio"]
 logger = logging.getLogger(__name__)
 
 
 class PersonalLoanApplication(BaseModel):
     case_id: str = Field(min_length=1)
+    loan_profile_id: str | None = Field(default=None, min_length=1)
     loan_type: Literal["personal"]
     requested_amount: Decimal = Field(gt=0)
     term_months: int = Field(gt=0)
@@ -39,6 +47,7 @@ class PersonalLoanApplication(BaseModel):
 
 class SMELoanApplication(BaseModel):
     case_id: str = Field(min_length=1)
+    loan_profile_id: str | None = Field(default=None, min_length=1)
     loan_type: Literal["sme"]
     requested_amount: Decimal = Field(gt=0)
     term_months: int = Field(gt=0)
@@ -322,19 +331,39 @@ def validate_document_page_call(tool_name: str, raw_arguments: str) -> dict[str,
     return arguments
 
 
-def _validate_credit_rag_call(tool_name: str, raw_arguments: str) -> dict[str, Any]:
+def validate_loan_data_call(tool_name: str, raw_arguments: str) -> dict[str, Any]:
+    id_fields = {
+        "get_loan_profile": "loan_profile_id",
+        "get_customer": "customer_id",
+        "list_reports": "loan_profile_id",
+    }
+    field_name = id_fields.get(tool_name)
+    if field_name is None:
+        raise ValueError("Unsupported loan data tool")
+    try:
+        arguments = json.loads(raw_arguments)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise ValueError(f"{tool_name} arguments must be valid JSON") from error
+    if not isinstance(arguments, dict) or set(arguments) != {field_name}:
+        raise ValueError(f"{tool_name} requires exactly {field_name}")
+    if not isinstance(arguments[field_name], str) or not arguments[field_name].strip():
+        raise ValueError(f"{tool_name} {field_name} must be a non-empty string")
+    return arguments
+
+
+def _validate_credit_tool_call(tool_name: str, raw_arguments: str) -> dict[str, Any]:
     if tool_name == "search_knowledge":
         return validate_search_knowledge_call(tool_name, raw_arguments)
     if tool_name == "get_document_page":
         return validate_document_page_call(tool_name, raw_arguments)
-    raise ValueError("Only search_knowledge and get_document_page may be invoked")
+    return validate_loan_data_call(tool_name, raw_arguments)
 
 
 class CreditRAGRunHooks(RunHooksBase):
     async def on_tool_start(self, context, agent, tool) -> None:
         if not isinstance(context, ToolContext):
             raise ValueError("Credit Agent tool calls require ToolContext")
-        _validate_credit_rag_call(context.tool_name, context.tool_arguments)
+        _validate_credit_tool_call(context.tool_name, context.tool_arguments)
         if not isinstance(tool, FunctionTool):
             raise ValueError("Credit Agent may only invoke the credit-rag MCP tool")
         origin = get_function_tool_origin(tool)
@@ -401,7 +430,7 @@ def extract_trusted_evidence(new_items: list[Any]) -> list[KnowledgeEvidence]:
                 raise ValueError("credit-rag tool call is missing its call ID or arguments")
             if call_id in calls:
                 raise ValueError(f"Duplicate credit-rag call ID: {call_id}")
-            arguments = _validate_credit_rag_call(item.tool_name or "", raw_arguments)
+            arguments = _validate_credit_tool_call(item.tool_name or "", raw_arguments)
             calls[call_id] = (item, arguments)
         elif isinstance(item, ToolCallOutputItem):
             _require_credit_rag_origin(item)
@@ -421,6 +450,8 @@ def extract_trusted_evidence(new_items: list[Any]) -> list[KnowledgeEvidence]:
         output = outputs.get(call_id)
         if output is None:
             raise ValueError(f"Missing credit-rag output for call: {call_id}")
+        if call.tool_name in {"get_loan_profile", "get_customer", "list_reports"}:
+            continue
         tool_evidence = _parse_evidence_output(output.output)
         if call.tool_name == "search_knowledge":
             search_evidence.extend(tool_evidence)
@@ -464,6 +495,10 @@ def build_credit_agent(server: MCPServerStreamableHttp, model: str) -> Agent:
         name="Credit Agent",
         instructions=(
             "Assess one personal or SME loan application. "
+            "When loan_profile_id is supplied, use get_loan_profile to read the persisted "
+            "case; you may then use its customer_id with get_customer and use list_reports "
+            "for existing case history. Treat loan data tool results as supplemental context "
+            "and never create or update records. "
             "Before making any policy finding, call search_knowledge with "
             "domain='credit' and top_k=5. If a returned excerpt lacks enough context, "
             "call get_document_page with the exact source_id from that search evidence. "
@@ -504,7 +539,7 @@ def build_mcp_server(mcp_url: str) -> MCPServerStreamableHttp:
         cache_tools_list=True,
         client_session_timeout_seconds=30,
         tool_filter={
-            "allowed_tool_names": ["search_knowledge", "get_document_page"]
+            "allowed_tool_names": CREDIT_MCP_TOOL_NAMES
         },
         use_structured_content=True,
     )
@@ -518,12 +553,9 @@ async def execute_credit_decision(
 ) -> CreditDecisionExecution:
     async with build_mcp_server(mcp_url) as server:
         tools = await server.list_tools()
-        if {tool.name for tool in tools} != {
-            "search_knowledge",
-            "get_document_page",
-        }:
+        if {tool.name for tool in tools} != set(CREDIT_MCP_TOOL_NAMES):
             raise RuntimeError(
-                "RAG MCP server must expose search_knowledge and get_document_page"
+                "Credit MCP server exposes an unexpected tool set"
             )
         agent = build_credit_agent(server, model)
         result = await Runner.run(

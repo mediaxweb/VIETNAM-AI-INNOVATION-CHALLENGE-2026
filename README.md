@@ -232,21 +232,28 @@ It calculates financial ratios in Python, retrieves credit policy evidence from 
 RAG MCP server, and returns a structured recommendation for manual review. It does
 not approve, reject, or update a loan.
 
-The RAG MCP server must expose:
+The Credit Agent MCP server exposes five read-only tools:
 
 ```text
 search_knowledge(domain="credit", query: str, top_k: int = 5)
 get_document_page(domain="credit", source_id: str)
+get_loan_profile(loan_profile_id: str)
+get_customer(customer_id: str)
+list_reports(loan_profile_id: str)
 ```
 
 The agent searches chunks first. When an excerpt lacks enough context, it may
 read the full page only by reusing a `source_id` returned by `search_knowledge`.
+When normalized input includes `loan_profile_id`, it may also read the persisted
+profile, referenced customer, and existing reports. The MCP does not expose
+uploads, checks, calculations, updates, or other write operations to the model.
 
-Start the FastMCP adapter against the user-scoped collection containing credit
-policy documents:
+Start the FastMCP adapter with separate scopes for credit policy and persisted
+loan cases:
 
 ```powershell
 $env:RAG_MCP_USER_ID="<credit-policy-user-id>"
+$env:LOAN_AGENT_MCP_USER_ID="<loan-api-user-id>"
 & '.\.venv\Scripts\python.exe' -m app.rag_mcp_server
 ```
 

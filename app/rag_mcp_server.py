@@ -8,7 +8,13 @@ from typing import Any, Literal
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.api.schemas.loan_agent import (
+    CustomerResponse,
+    LoanProfileResponse,
+    ReportsListResponse,
+)
 from app.services.knowledge_base_service import KnowledgeBaseService
+from app.services.loan_agent_service import LoanAgentService
 
 
 class KnowledgeEvidence(BaseModel):
@@ -30,6 +36,13 @@ def _required_text(value: Any, field_name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"Retrieved chunk requires {field_name}")
     return value.strip()
+
+
+def _loan_user_id() -> str:
+    return _required_text(
+        os.getenv("LOAN_AGENT_MCP_USER_ID", ""),
+        "LOAN_AGENT_MCP_USER_ID",
+    )
 
 
 def _chunk_to_evidence(chunk: Any) -> KnowledgeEvidence:
@@ -131,6 +144,7 @@ async def retrieve_document_page(
 
 
 knowledge_base_service = KnowledgeBaseService()
+loan_agent_service = LoanAgentService()
 mcp = FastMCP(
     "credit-rag",
     host=os.getenv("RAG_MCP_HOST", "127.0.0.1"),
@@ -169,6 +183,48 @@ async def get_document_page(
         user_id=os.getenv("RAG_MCP_USER_ID", ""),
         service=knowledge_base_service,
     )
+
+
+@mcp.tool(structured_output=True)
+async def get_loan_profile(loan_profile_id: str) -> LoanProfileResponse:
+    """Read one persisted loan profile from the authenticated MCP user scope."""
+    normalized_id = _required_text(loan_profile_id, "loan_profile_id")
+    user_id = _loan_user_id()
+    try:
+        return await loan_agent_service.get_loan_profile(
+            user_id=user_id,
+            loan_profile_id=normalized_id,
+        )
+    except Exception:
+        raise RuntimeError("Loan profile retrieval failed") from None
+
+
+@mcp.tool(structured_output=True)
+async def get_customer(customer_id: str) -> CustomerResponse:
+    """Read one customer referenced by a persisted loan profile."""
+    normalized_id = _required_text(customer_id, "customer_id")
+    user_id = _loan_user_id()
+    try:
+        return await loan_agent_service.get_customer(
+            user_id=user_id,
+            customer_id=normalized_id,
+        )
+    except Exception:
+        raise RuntimeError("Customer retrieval failed") from None
+
+
+@mcp.tool(structured_output=True)
+async def list_reports(loan_profile_id: str) -> ReportsListResponse:
+    """List existing case reports without creating or updating case data."""
+    normalized_id = _required_text(loan_profile_id, "loan_profile_id")
+    user_id = _loan_user_id()
+    try:
+        return await loan_agent_service.list_reports(
+            user_id=user_id,
+            loan_profile_id=normalized_id,
+        )
+    except Exception:
+        raise RuntimeError("Loan report retrieval failed") from None
 
 
 def main() -> None:
