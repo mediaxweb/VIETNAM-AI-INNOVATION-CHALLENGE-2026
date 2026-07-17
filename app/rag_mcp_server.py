@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, Literal
 
+from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.services.knowledge_base_service import KnowledgeBaseService
@@ -78,3 +80,38 @@ async def retrieve_credit_evidence(
     if len(source_ids) != len(set(source_ids)):
         raise ValueError("Duplicate evidence source_id")
     return KnowledgeEvidenceEnvelope(evidence=evidence)
+
+
+knowledge_base_service = KnowledgeBaseService()
+mcp = FastMCP(
+    "credit-rag",
+    host=os.getenv("RAG_MCP_HOST", "127.0.0.1"),
+    port=int(os.getenv("RAG_MCP_PORT", "8766")),
+    streamable_http_path="/mcp",
+    json_response=True,
+    stateless_http=True,
+)
+
+
+@mcp.tool(structured_output=True)
+async def search_knowledge(
+    domain: Literal["credit"],
+    query: str,
+    top_k: int = 5,
+) -> KnowledgeEvidenceEnvelope:
+    """Retrieve grounded evidence from the credit-policy knowledge base."""
+    return await retrieve_credit_evidence(
+        domain,
+        query,
+        top_k,
+        user_id=os.getenv("RAG_MCP_USER_ID", ""),
+        service=knowledge_base_service,
+    )
+
+
+def main() -> None:
+    mcp.run(transport="streamable-http")
+
+
+if __name__ == "__main__":
+    main()

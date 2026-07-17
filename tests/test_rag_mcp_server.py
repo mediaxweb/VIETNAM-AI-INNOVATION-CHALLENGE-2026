@@ -2,6 +2,7 @@ import asyncio
 
 import pytest
 
+from app import rag_mcp_server
 from app.rag_mcp_server import retrieve_credit_evidence
 
 
@@ -133,3 +134,27 @@ def test_retrieval_error_is_redacted():
         )
 
     assert str(error.value) == "Credit knowledge retrieval failed"
+
+
+def test_fastmcp_exposes_only_search_knowledge():
+    tools = asyncio.run(rag_mcp_server.mcp.list_tools())
+
+    assert [tool.name for tool in tools] == ["search_knowledge"]
+
+
+def test_fastmcp_tool_reads_user_scope_from_environment(monkeypatch):
+    service = FakeKnowledgeBaseService([chunk(1)])
+    monkeypatch.setattr(rag_mcp_server, "knowledge_base_service", service)
+    monkeypatch.setenv("RAG_MCP_USER_ID", "credit-policy-user")
+
+    result = asyncio.run(rag_mcp_server.search_knowledge("credit", "DTI", 5))
+
+    assert result.evidence[0].source_id == "source-1"
+    assert service.calls == [("DTI", None, "credit-policy-user")]
+
+
+def test_fastmcp_tool_fails_without_user_scope(monkeypatch):
+    monkeypatch.delenv("RAG_MCP_USER_ID", raising=False)
+
+    with pytest.raises(ValueError, match="RAG_MCP_USER_ID"):
+        asyncio.run(rag_mcp_server.search_knowledge("credit", "DTI", 5))

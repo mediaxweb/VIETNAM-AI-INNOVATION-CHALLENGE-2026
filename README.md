@@ -194,6 +194,17 @@ The RAG MCP server must expose:
 search_knowledge(domain="credit", query: str, top_k: int = 5)
 ```
 
+Start the FastMCP adapter against the user-scoped collection containing credit
+policy documents:
+
+```powershell
+$env:RAG_MCP_USER_ID="<credit-policy-user-id>"
+& '.\.venv\Scripts\python.exe' -m app.rag_mcp_server
+```
+
+The default MCP endpoint is `http://127.0.0.1:8766/mcp`. Override its bind
+address with `RAG_MCP_HOST` and `RAG_MCP_PORT` when needed.
+
 The RAG corpus contains text documents or PDFs with a text layer. OCR is outside
 this project scope.
 
