@@ -21,6 +21,7 @@ class Configs(BaseSettings):
     rag_brain_openclaw_api_key: Optional[str] = None
     openai_qna_model: str = "gpt-5.4-mini"
     temp_kb_dir: str = "tmp/knowledge_base"
+    loan_upload_dir: Optional[str] = None
 
     @staticmethod
     def _normalize_optional_path(value: Optional[str]) -> Optional[str]:
@@ -68,6 +69,18 @@ class Configs(BaseSettings):
     @property
     def resolved_rag_brain_openclaw_api_key(self) -> Optional[str]:
         return self._normalize_optional_secret(self.rag_brain_openclaw_api_key)
+
+    @property
+    def resolved_loan_upload_dir(self) -> str:
+        explicit = self._normalize_optional_path(self.loan_upload_dir)
+        if explicit:
+            return explicit
+
+        storage_root = self.resolved_storage_root
+        if storage_root:
+            return str(Path(storage_root) / "loan_uploads")
+
+        return "./loan_uploads"
 
     class Config:
         env_file = (".env",)

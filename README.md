@@ -15,6 +15,8 @@ apps and workflows.
   final answers with OpenAI.
 - Persistent storage for Chroma, BM25, and the LlamaIndex document store so
   retrievers can be reused across runs.
+- Loan-agent MVP APIs under `/api/v1/loan` for customer intake, loan profiles,
+  compliance checks, operations tasks, limit calculation, and case reports.
 
 ## Service architecture
 
@@ -24,6 +26,7 @@ FastAPI routes
   /api/v1/auth/login
   /api/v1/auth/me
   /api/v1/knowledge-base/process-document
+  /api/v1/loan/...
   /api/v1/qna/question_and_answer
             |
             v
@@ -36,6 +39,11 @@ KnowledgeBaseService
             v
 LlamaIndex + Chroma + BM25
 MongoDB user_indexed_files registry
+LoanAgentService
+  - tracks customers and loan profiles
+  - stores uploaded loan documents
+  - runs MVP rule checks and limit calculations
+  - creates tasks, checklists, compliance results, and reports
 ```
 
 ## API surface
@@ -150,6 +158,42 @@ curl -X POST "http://localhost:8000/api/v1/qna/question_and_answer" \
       }'
 ```
 
+### Loan Agent MVP APIs
+
+Loan-agent APIs are protected by the same Bearer auth as the knowledge-base
+routes. Uploaded legal, financial, and collateral documents use
+`multipart/form-data`.
+
+| Agent | API | Endpoint |
+|-------|-----|----------|
+| Credit | `create_customer` | `POST /api/v1/loan/customers` |
+| Credit | `get_customer` | `GET /api/v1/loan/customers/{customer_id}` |
+| Credit | `update_customer` | `PATCH /api/v1/loan/customers/{customer_id}` |
+| Credit | `create_loan_profile` | `POST /api/v1/loan/loan-profiles` |
+| Credit | `upload_legal_doc` | `POST /api/v1/loan/loan-profiles/{loan_profile_id}/legal-docs` |
+| Credit | `check_legal_docs` | `POST /api/v1/loan/loan-profiles/{loan_profile_id}/check-legal-docs` |
+| Compliance | `get_loan_profile` | `GET /api/v1/loan/loan-profiles/{loan_profile_id}` |
+| Compliance | `upload_financial_report` | `POST /api/v1/loan/loan-profiles/{loan_profile_id}/financial-reports` |
+| Compliance | `upload_collateral` | `POST /api/v1/loan/loan-profiles/{loan_profile_id}/collaterals` |
+| Compliance | `check_financials` | `POST /api/v1/loan/loan-profiles/{loan_profile_id}/check-financials` |
+| Compliance | `check_collateral` | `POST /api/v1/loan/loan-profiles/{loan_profile_id}/check-collateral` |
+| Compliance | `check_credit_rule` | `POST /api/v1/loan/loan-profiles/{loan_profile_id}/check-credit-rule` |
+| Compliance | `save_compliance_result` | `POST /api/v1/loan/loan-profiles/{loan_profile_id}/compliance-result` |
+| Operations | `update_case_status` | `PATCH /api/v1/loan/loan-profiles/{loan_profile_id}/status` |
+| Operations | `create_checklist` | `POST /api/v1/loan/loan-profiles/{loan_profile_id}/checklist` |
+| Operations | `calculate_loan_limit` | `POST /api/v1/loan/loan-profiles/{loan_profile_id}/calculate-limit` |
+| Operations | `create_task` | `POST /api/v1/loan/loan-profiles/{loan_profile_id}/tasks` |
+| Operations | `create_report` | `POST /api/v1/loan/loan-profiles/{loan_profile_id}/reports` |
+| Operations | `list_reports` | `GET /api/v1/loan/loan-profiles/{loan_profile_id}/reports` |
+
+Minimal demo flow:
+
+```text
+create_customer -> create_loan_profile -> upload_legal_doc ->
+upload_financial_report -> upload_collateral -> check_* ->
+calculate_loan_limit -> create_task -> create_report
+```
+
 ### OpenClaw tool access
 
 `POST /api/v1/qna/retrieve-chunks` and
@@ -231,13 +275,14 @@ Create a `.env` file in the project root and configure the values you need.
 | `DOCSTORE_PERSIST_DIR` | derived | Explicit path used to persist the LlamaIndex document store. Overrides `STORAGE_ROOT` when set. |
 | `RAG_BRAIN_OPENCLAW_API_KEY` | unset | Short shared secret accepted with `X-OpenClaw-Api-Key` for OpenClaw access to `retrieve-chunks` and `document-text`; callers must also send `X-OpenClaw-User-Id`. |
 | `TEMP_KB_DIR` | `tmp/knowledge_base` | Ephemeral working directory for uploaded PDF files during ingestion. |
+| `LOAN_UPLOAD_DIR` | derived | Explicit loan-agent upload storage path. Defaults to `STORAGE_ROOT/loan_uploads` when `STORAGE_ROOT` is set, otherwise `./loan_uploads`. |
 
 Persistence resolution rules:
 
 - If `LLAMA_CHROMA_PERSIST_DIR`, `BM25_PERSIST_DIR`, or `DOCSTORE_PERSIST_DIR` are set, the app uses them as-is.
-- Otherwise, if `STORAGE_ROOT` is set, the app derives `chroma_db`, `bm25_storage`, and `docstore` under that root.
+- Otherwise, if `STORAGE_ROOT` is set, the app derives `chroma_db`, `bm25_storage`, `docstore`, and `loan_uploads` under that root.
 - Otherwise, if `RAILWAY_VOLUME_MOUNT_PATH` is set, the app derives the same subdirectories under that mount path.
-- Otherwise, local development falls back to `./chroma_db`, `./bm25_storage`, and `./docstore`.
+- Otherwise, local development falls back to `./chroma_db`, `./bm25_storage`, `./docstore`, and `./loan_uploads`.
 
 ### Embedding providers
 

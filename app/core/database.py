@@ -9,6 +9,19 @@ load_dotenv()
 
 
 USER_INDEXED_FILES_COLLECTION_NAME = "user_indexed_files"
+LOAN_AGENT_COLLECTION_NAMES = (
+    "loan_customers",
+    "loan_profiles",
+    "loan_legal_docs",
+    "loan_financial_reports",
+    "loan_collaterals",
+    "loan_agent_checks",
+    "loan_compliance_results",
+    "loan_checklists",
+    "loan_limit_calculations",
+    "loan_tasks",
+    "loan_reports",
+)
 
 KB_DOCUMENT_INDEX_STATUS_INDEXED = "indexed"
 KB_DOCUMENT_INDEX_STATUS_DELETED = "deleted"
@@ -71,6 +84,14 @@ class Database:
         """Get the registry collection for user-scoped indexed files."""
 
         return cls.get_database()[USER_INDEXED_FILES_COLLECTION_NAME]
+
+    @classmethod
+    def get_loan_collection(cls, collection_name: str):
+        """Get one collection used by the loan-agent domain."""
+
+        if collection_name not in LOAN_AGENT_COLLECTION_NAMES:
+            raise ValueError(f"Unknown loan-agent collection '{collection_name}'.")
+        return cls.get_database()[collection_name]
     
     @classmethod
     async def close_connection(cls):
@@ -95,6 +116,40 @@ async def ensure_user_indexed_files_indexes():
     )
 
 
+async def ensure_loan_agent_indexes():
+    """Create indexes required by user-scoped loan-agent collections."""
+
+    for collection_name in LOAN_AGENT_COLLECTION_NAMES:
+        collection = Database.get_loan_collection(collection_name)
+        await collection.create_index(
+            [("user_id", ASCENDING), ("created_at", ASCENDING)],
+            name=f"{collection_name}_user_created_at",
+        )
+
+    loan_profiles = Database.get_loan_collection("loan_profiles")
+    await loan_profiles.create_index(
+        [("user_id", ASCENDING), ("customer_id", ASCENDING)],
+        name="loan_profiles_user_customer",
+    )
+
+    for collection_name in (
+        "loan_legal_docs",
+        "loan_financial_reports",
+        "loan_collaterals",
+        "loan_agent_checks",
+        "loan_compliance_results",
+        "loan_checklists",
+        "loan_limit_calculations",
+        "loan_tasks",
+        "loan_reports",
+    ):
+        collection = Database.get_loan_collection(collection_name)
+        await collection.create_index(
+            [("user_id", ASCENDING), ("loan_profile_id", ASCENDING)],
+            name=f"{collection_name}_user_loan_profile",
+        )
+
+
 async def init_db():
     """Initialize and validate the MongoDB connection."""
     print(">>> INIT DB START")
@@ -106,4 +161,5 @@ async def init_db():
         name="users_email_unique",
     )
     await ensure_user_indexed_files_indexes()
+    await ensure_loan_agent_indexes()
     print(">>> INIT DB DONE")
