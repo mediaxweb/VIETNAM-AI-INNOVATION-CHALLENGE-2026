@@ -82,6 +82,54 @@ async def retrieve_credit_evidence(
     return KnowledgeEvidenceEnvelope(evidence=evidence)
 
 
+async def retrieve_document_page(
+    domain: str,
+    source_id: str,
+    *,
+    user_id: str,
+    service: KnowledgeBaseService,
+) -> KnowledgeEvidenceEnvelope:
+    if domain != "credit":
+        raise ValueError("get_document_page domain must be credit")
+    normalized_source_id = _required_text(source_id, "source_id")
+    normalized_user_id = _required_text(user_id, "RAG_MCP_USER_ID")
+
+    try:
+        chunk = await asyncio.to_thread(
+            service.get_chunk_detail,
+            normalized_source_id,
+            user_id=normalized_user_id,
+        )
+        metadata = chunk.metadata
+        if not isinstance(metadata, Mapping):
+            raise ValueError("Chunk metadata must be an object")
+        normalized_file_name = _required_text(metadata.get("file_name"), "file_name")
+        normalized_page = _required_text(metadata.get("page_label"), "page_label")
+        result = await asyncio.to_thread(
+            service.get_document_text,
+            normalized_file_name,
+            page_label=normalized_page,
+            user_id=normalized_user_id,
+        )
+    except Exception:
+        raise RuntimeError("Document page retrieval failed") from None
+
+    result_file_name = _required_text(result.document_path, "document_path")
+    result_page = _required_text(result.page_label, "page_label")
+    if (result_file_name, result_page) != (normalized_file_name, normalized_page):
+        raise ValueError("RAG returned a different document page")
+    return KnowledgeEvidenceEnvelope(
+        evidence=[
+            KnowledgeEvidence(
+                source_id=f"page:{normalized_source_id}",
+                file_name=result_file_name,
+                page=result_page,
+                excerpt=_required_text(result.text, "page text"),
+            )
+        ]
+    )
+
+
 knowledge_base_service = KnowledgeBaseService()
 mcp = FastMCP(
     "credit-rag",
@@ -104,6 +152,20 @@ async def search_knowledge(
         domain,
         query,
         top_k,
+        user_id=os.getenv("RAG_MCP_USER_ID", ""),
+        service=knowledge_base_service,
+    )
+
+
+@mcp.tool(structured_output=True)
+async def get_document_page(
+    domain: Literal["credit"],
+    source_id: str,
+) -> KnowledgeEvidenceEnvelope:
+    """Read the full indexed page for evidence returned by search_knowledge."""
+    return await retrieve_document_page(
+        domain,
+        source_id,
         user_id=os.getenv("RAG_MCP_USER_ID", ""),
         service=knowledge_base_service,
     )

@@ -192,7 +192,11 @@ The RAG MCP server must expose:
 
 ```text
 search_knowledge(domain="credit", query: str, top_k: int = 5)
+get_document_page(domain="credit", source_id: str)
 ```
+
+The agent searches chunks first. When an excerpt lacks enough context, it may
+read the full page only by reusing a `source_id` returned by `search_knowledge`.
 
 Start the FastMCP adapter against the user-scoped collection containing credit
 policy documents:

@@ -22,6 +22,7 @@ from credit_agent import (
     extract_trusted_evidence,
     fail_closed_assessment,
     run_credit_assessment,
+    validate_document_page_call,
     validate_search_knowledge_call,
 )
 
@@ -182,11 +183,27 @@ def valid_execution(draft=None):
     )
 
 
+def page_evidence(
+    source_id="credit-policy-1",
+    file_name="credit-policy.pdf",
+    page="12",
+):
+    return KnowledgeEvidence(
+        source_id=f"page:{source_id}",
+        file_name=file_name,
+        page=page,
+        excerpt="Toàn bộ nội dung trang chính sách tín dụng.",
+    )
+
+
 def rag_run_items(
     *,
     arguments=None,
     output=None,
     origin=None,
+    tool_name="search_knowledge",
+    call_id="call-1",
+    evidence=None,
 ):
     agent = Agent(name="Test Agent")
     tool_origin = origin or ToolOrigin(
@@ -198,18 +215,22 @@ def rag_run_items(
         raw_item=ResponseFunctionToolCall(
             arguments=json.dumps(
                 arguments
-                or {"domain": "credit", "query": "personal loan DTI", "top_k": 5}
+                if arguments is not None
+                else {"domain": "credit", "query": "personal loan DTI", "top_k": 5}
             ),
-            call_id="call-1",
-            name="search_knowledge",
+            call_id=call_id,
+            name=tool_name,
             type="function_call",
         ),
         tool_origin=tool_origin,
     )
-    evidence_payload = [item.model_dump(mode="json") for item in valid_draft().evidence]
+    evidence_payload = [
+        item.model_dump(mode="json")
+        for item in (evidence if evidence is not None else valid_draft().evidence)
+    ]
     tool_output = ToolCallOutputItem(
         agent=agent,
-        raw_item={"type": "function_call_output", "call_id": "call-1"},
+        raw_item={"type": "function_call_output", "call_id": call_id},
         output=(
             output
             if output is not None
@@ -377,10 +398,12 @@ def test_runner_fails_closed_when_runtime_raises(caplog):
         assert sensitive_value not in caplog.text
 
 
-def test_mcp_server_allowlist_exposes_only_search_knowledge():
+def test_mcp_server_allowlist_exposes_search_and_document_page():
     server = build_mcp_server("http://rag.test/mcp")
 
-    assert server.tool_filter == {"allowed_tool_names": ["search_knowledge"]}
+    assert server.tool_filter == {
+        "allowed_tool_names": ["search_knowledge", "get_document_page"]
+    }
 
 
 @pytest.mark.parametrize(
@@ -409,6 +432,27 @@ def test_search_knowledge_contract_accepts_exact_arguments():
     )
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "arguments"),
+    [
+        ("delete_document", {"domain": "credit", "source_id": "source-1"}),
+        ("get_document_page", {"domain": "hr", "source_id": "source-1"}),
+        ("get_document_page", {"domain": "credit", "source_id": "  "}),
+        ("get_document_page", {"domain": "credit"}),
+    ],
+)
+def test_document_page_contract_rejects_invalid_calls(tool_name, arguments):
+    with pytest.raises(ValueError):
+        validate_document_page_call(tool_name, json.dumps(arguments))
+
+
+def test_document_page_contract_accepts_exact_arguments():
+    assert validate_document_page_call(
+        "get_document_page",
+        json.dumps({"domain": "credit", "source_id": "credit-policy-1"}),
+    ) == {"domain": "credit", "source_id": "credit-policy-1"}
+
+
 def test_run_hook_validates_arguments_before_tool_invocation():
     context = ToolContext(
         None,
@@ -433,6 +477,56 @@ def test_extracts_trusted_evidence_from_direct_list_output():
     evidence = extract_trusted_evidence(rag_run_items(output=json.dumps(payload)))
 
     assert evidence == valid_draft().evidence
+
+
+def test_extracts_full_page_only_when_it_matches_prior_search_evidence():
+    page_item = page_evidence()
+    evidence = extract_trusted_evidence(
+        rag_run_items()
+        + rag_run_items(
+            tool_name="get_document_page",
+            call_id="call-2",
+            arguments={
+                "domain": "credit",
+                "source_id": "credit-policy-1",
+            },
+            evidence=[page_item],
+        )
+    )
+
+    assert evidence == valid_draft().evidence + [page_item]
+
+
+def test_page_lookup_without_matching_search_evidence_is_rejected():
+    with pytest.raises(ValueError, match="prior search evidence"):
+        extract_trusted_evidence(
+            rag_run_items()
+            + rag_run_items(
+                tool_name="get_document_page",
+                call_id="call-2",
+                arguments={
+                    "domain": "credit",
+                    "source_id": "other-source",
+                },
+                evidence=[page_evidence("other-source", "other-policy.pdf", "3")],
+            )
+        )
+
+
+def test_page_output_that_differs_from_requested_page_is_rejected():
+    with pytest.raises(ValueError, match="requested document page"):
+        extract_trusted_evidence(
+            rag_run_items()
+            + rag_run_items(
+                tool_name="get_document_page",
+                call_id="call-2",
+                arguments={
+                    "domain": "credit",
+                    "source_id": "credit-policy-1",
+                },
+                evidence=[page_evidence("credit-policy-1", "credit-policy.pdf", "13")],
+            )
+        )
 
 
 def test_evidence_extraction_rejects_missing_call():

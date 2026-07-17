@@ -306,11 +306,35 @@ def validate_search_knowledge_call(tool_name: str, raw_arguments: str) -> dict[s
     return arguments
 
 
+def validate_document_page_call(tool_name: str, raw_arguments: str) -> dict[str, Any]:
+    if tool_name != "get_document_page":
+        raise ValueError("Only get_document_page may be invoked")
+    try:
+        arguments = json.loads(raw_arguments)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise ValueError("get_document_page arguments must be valid JSON") from error
+    if not isinstance(arguments, dict) or set(arguments) != {"domain", "source_id"}:
+        raise ValueError("get_document_page requires exactly domain and source_id")
+    if arguments["domain"] != "credit":
+        raise ValueError("get_document_page domain must be credit")
+    if not isinstance(arguments["source_id"], str) or not arguments["source_id"].strip():
+        raise ValueError("get_document_page source_id must be a non-empty string")
+    return arguments
+
+
+def _validate_credit_rag_call(tool_name: str, raw_arguments: str) -> dict[str, Any]:
+    if tool_name == "search_knowledge":
+        return validate_search_knowledge_call(tool_name, raw_arguments)
+    if tool_name == "get_document_page":
+        return validate_document_page_call(tool_name, raw_arguments)
+    raise ValueError("Only search_knowledge and get_document_page may be invoked")
+
+
 class CreditRAGRunHooks(RunHooksBase):
     async def on_tool_start(self, context, agent, tool) -> None:
         if not isinstance(context, ToolContext):
             raise ValueError("Credit Agent tool calls require ToolContext")
-        validate_search_knowledge_call(context.tool_name, context.tool_arguments)
+        _validate_credit_rag_call(context.tool_name, context.tool_arguments)
         if not isinstance(tool, FunctionTool):
             raise ValueError("Credit Agent may only invoke the credit-rag MCP tool")
         origin = get_function_tool_origin(tool)
@@ -362,7 +386,7 @@ def _require_credit_rag_origin(item: ToolCallItem | ToolCallOutputItem) -> None:
 
 
 def extract_trusted_evidence(new_items: list[Any]) -> list[KnowledgeEvidence]:
-    calls: dict[str, ToolCallItem] = {}
+    calls: dict[str, tuple[ToolCallItem, dict[str, Any]]] = {}
     outputs: dict[str, ToolCallOutputItem] = {}
     for item in new_items:
         if isinstance(item, ToolCallItem):
@@ -377,8 +401,8 @@ def extract_trusted_evidence(new_items: list[Any]) -> list[KnowledgeEvidence]:
                 raise ValueError("credit-rag tool call is missing its call ID or arguments")
             if call_id in calls:
                 raise ValueError(f"Duplicate credit-rag call ID: {call_id}")
-            validate_search_knowledge_call(item.tool_name or "", raw_arguments)
-            calls[call_id] = item
+            arguments = _validate_credit_rag_call(item.tool_name or "", raw_arguments)
+            calls[call_id] = (item, arguments)
         elif isinstance(item, ToolCallOutputItem):
             _require_credit_rag_origin(item)
             call_id = item.call_id
@@ -392,13 +416,43 @@ def extract_trusted_evidence(new_items: list[Any]) -> list[KnowledgeEvidence]:
         raise ValueError("No credit-rag search_knowledge call found")
 
     trusted_evidence: list[KnowledgeEvidence] = []
-    for call_id in calls:
+    search_evidence: list[KnowledgeEvidence] = []
+    for call_id, (call, arguments) in calls.items():
         output = outputs.get(call_id)
         if output is None:
             raise ValueError(f"Missing credit-rag output for call: {call_id}")
-        trusted_evidence.extend(_parse_evidence_output(output.output))
+        tool_evidence = _parse_evidence_output(output.output)
+        if call.tool_name == "search_knowledge":
+            search_evidence.extend(tool_evidence)
+        else:
+            search_item = next(
+                (
+                    item
+                    for item in search_evidence
+                    if item.source_id == arguments["source_id"]
+                ),
+                None,
+            )
+            if search_item is None:
+                raise ValueError("get_document_page requires prior search evidence")
+            if len(tool_evidence) != 1:
+                raise ValueError("get_document_page must return exactly one evidence item")
+            page_evidence = tool_evidence[0]
+            if (
+                page_evidence.file_name,
+                page_evidence.page,
+                page_evidence.source_id,
+            ) != (
+                search_item.file_name,
+                search_item.page,
+                f"page:{arguments['source_id']}",
+            ):
+                raise ValueError("get_document_page returned a different requested document page")
+        trusted_evidence.extend(tool_evidence)
     if set(outputs) != set(calls):
         raise ValueError("credit-rag output does not match a tool call")
+    if not search_evidence:
+        raise ValueError("No credit-rag search_knowledge call found")
     if not trusted_evidence:
         raise ValueError("credit-rag returned no evidence")
     _evidence_by_id(trusted_evidence)
@@ -411,7 +465,10 @@ def build_credit_agent(server: MCPServerStreamableHttp, model: str) -> Agent:
         instructions=(
             "Assess one personal or SME loan application. "
             "Before making any policy finding, call search_knowledge with "
-            "domain='credit' and top_k=5. Use only evidence returned by that tool. "
+            "domain='credit' and top_k=5. If a returned excerpt lacks enough context, "
+            "call get_document_page with the exact source_id from that search evidence. "
+            "Never read a page for a source_id not returned by search_knowledge. "
+            "Use only evidence returned by these tools. "
             "Copy source_id, file_name, page, and excerpt into evidence, and make every "
             "finding reference existing evidence_ids. Treat supplied metrics as immutable. "
             "Never approve, reject, or update a loan. Return undetermined and request more "
@@ -446,7 +503,9 @@ def build_mcp_server(mcp_url: str) -> MCPServerStreamableHttp:
         name="credit-rag",
         cache_tools_list=True,
         client_session_timeout_seconds=30,
-        tool_filter={"allowed_tool_names": ["search_knowledge"]},
+        tool_filter={
+            "allowed_tool_names": ["search_knowledge", "get_document_page"]
+        },
         use_structured_content=True,
     )
 
@@ -459,8 +518,13 @@ async def execute_credit_decision(
 ) -> CreditDecisionExecution:
     async with build_mcp_server(mcp_url) as server:
         tools = await server.list_tools()
-        if {tool.name for tool in tools} != {"search_knowledge"}:
-            raise RuntimeError("RAG MCP server must expose only search_knowledge")
+        if {tool.name for tool in tools} != {
+            "search_knowledge",
+            "get_document_page",
+        }:
+            raise RuntimeError(
+                "RAG MCP server must expose search_knowledge and get_document_page"
+            )
         agent = build_credit_agent(server, model)
         result = await Runner.run(
             agent,

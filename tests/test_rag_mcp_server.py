@@ -1,22 +1,49 @@
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
 from app import rag_mcp_server
-from app.rag_mcp_server import retrieve_credit_evidence
+from app.rag_mcp_server import retrieve_credit_evidence, retrieve_document_page
 
 
 class FakeKnowledgeBaseService:
-    def __init__(self, chunks=None, error=None):
+    def __init__(
+        self,
+        chunks=None,
+        error=None,
+        chunk_result=None,
+        chunk_error=None,
+        page_result=None,
+        page_error=None,
+    ):
         self.chunks = chunks or []
         self.error = error
+        self.chunk_result = chunk_result
+        self.chunk_error = chunk_error
+        self.page_result = page_result
+        self.page_error = page_error
         self.calls = []
+        self.chunk_calls = []
+        self.page_calls = []
 
     def retrieve_chunks(self, query, conversation_history=None, *, user_id):
         self.calls.append((query, conversation_history, user_id))
         if self.error:
             raise self.error
         return {"question": query, "chunks": self.chunks}
+
+    def get_chunk_detail(self, chunk_id, *, user_id):
+        self.chunk_calls.append((chunk_id, user_id))
+        if self.chunk_error:
+            raise self.chunk_error
+        return self.chunk_result
+
+    def get_document_text(self, document_path, *, page_label, user_id):
+        self.page_calls.append((document_path, page_label, user_id))
+        if self.page_error:
+            raise self.page_error
+        return self.page_result
 
 
 def chunk(index, *, window=None, text=None):
@@ -136,10 +163,117 @@ def test_retrieval_error_is_redacted():
     assert str(error.value) == "Credit knowledge retrieval failed"
 
 
-def test_fastmcp_exposes_only_search_knowledge():
+def test_document_page_returns_full_page_with_server_user_scope():
+    service = FakeKnowledgeBaseService(
+        chunk_result=SimpleNamespace(
+            metadata={"file_name": "credit-policy.pdf", "page_label": "12"}
+        ),
+        page_result=SimpleNamespace(
+            document_path="credit-policy.pdf",
+            page_label="12",
+            text="Full policy page text",
+        )
+    )
+
+    result = asyncio.run(
+        retrieve_document_page(
+            "credit",
+            " source-1 ",
+            user_id=" credit-policy-user ",
+            service=service,
+        )
+    )
+
+    assert service.chunk_calls == [("source-1", "credit-policy-user")]
+    assert service.page_calls == [
+        ("credit-policy.pdf", "12", "credit-policy-user")
+    ]
+    assert result.evidence[0].model_dump() == {
+        "source_id": "page:source-1",
+        "file_name": "credit-policy.pdf",
+        "page": "12",
+        "excerpt": "Full policy page text",
+    }
+
+
+@pytest.mark.parametrize(
+    ("domain", "source_id", "user_id"),
+    [
+        ("hr", "source-1", "credit-user"),
+        ("credit", "  ", "credit-user"),
+        ("credit", "source-1", "  "),
+    ],
+)
+def test_document_page_rejects_invalid_contract_before_lookup(
+    domain, source_id, user_id
+):
+    service = FakeKnowledgeBaseService()
+
+    with pytest.raises(ValueError):
+        asyncio.run(
+            retrieve_document_page(
+                domain,
+                source_id,
+                user_id=user_id,
+                service=service,
+            )
+        )
+
+    assert service.chunk_calls == []
+    assert service.page_calls == []
+
+
+def test_document_page_error_is_redacted():
+    service = FakeKnowledgeBaseService(
+        chunk_result=SimpleNamespace(
+            metadata={"file_name": "policy.pdf", "page_label": "1"}
+        ),
+        page_error=RuntimeError("secret page and collection detail")
+    )
+
+    with pytest.raises(RuntimeError) as error:
+        asyncio.run(
+            retrieve_document_page(
+                "credit",
+                "source-1",
+                user_id="credit-user",
+                service=service,
+            )
+        )
+
+    assert str(error.value) == "Document page retrieval failed"
+
+
+def test_document_page_rejects_a_different_page_from_rag():
+    service = FakeKnowledgeBaseService(
+        chunk_result=SimpleNamespace(
+            metadata={"file_name": "policy.pdf", "page_label": "1"}
+        ),
+        page_result=SimpleNamespace(
+            document_path="policy.pdf",
+            page_label="2",
+            text="Wrong page",
+        )
+    )
+
+    with pytest.raises(ValueError, match="different document page"):
+        asyncio.run(
+            retrieve_document_page(
+                "credit",
+                "source-1",
+                user_id="credit-user",
+                service=service,
+            )
+        )
+
+
+def test_fastmcp_exposes_search_and_document_page_tools():
     tools = asyncio.run(rag_mcp_server.mcp.list_tools())
 
-    assert [tool.name for tool in tools] == ["search_knowledge"]
+    assert [tool.name for tool in tools] == [
+        "search_knowledge",
+        "get_document_page",
+    ]
 
 
 def test_fastmcp_tool_reads_user_scope_from_environment(monkeypatch):
@@ -158,3 +292,28 @@ def test_fastmcp_tool_fails_without_user_scope(monkeypatch):
 
     with pytest.raises(ValueError, match="RAG_MCP_USER_ID"):
         asyncio.run(rag_mcp_server.search_knowledge("credit", "DTI", 5))
+
+
+def test_fastmcp_page_tool_reads_user_scope_from_environment(monkeypatch):
+    service = FakeKnowledgeBaseService(
+        chunk_result=SimpleNamespace(
+            metadata={"file_name": "policy.pdf", "page_label": "2"}
+        ),
+        page_result=SimpleNamespace(
+            document_path="policy.pdf",
+            page_label="2",
+            text="Full page",
+        )
+    )
+    monkeypatch.setattr(rag_mcp_server, "knowledge_base_service", service)
+    monkeypatch.setenv("RAG_MCP_USER_ID", "credit-policy-user")
+
+    result = asyncio.run(
+        rag_mcp_server.get_document_page("credit", "source-1")
+    )
+
+    assert result.evidence[0].excerpt == "Full page"
+    assert service.chunk_calls == [("source-1", "credit-policy-user")]
+    assert service.page_calls == [
+        ("policy.pdf", "2", "credit-policy-user")
+    ]
