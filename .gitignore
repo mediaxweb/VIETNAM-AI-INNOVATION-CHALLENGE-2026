@@ -205,6 +205,7 @@ tempCodeRunnerFile.py
 
 # Runtime artifacts
 tmp/
+loan_uploads/
 logs/page_*_info.txt
 
 # Ruff stuff:
