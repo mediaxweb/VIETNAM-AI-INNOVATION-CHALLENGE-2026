@@ -345,9 +345,13 @@ def test_runner_skips_executor_when_required_financial_data_is_missing():
 
 def test_runner_fails_closed_when_runtime_raises(caplog):
     application = personal_application()
+    sentinel = "SENTINEL_RUNTIME_SECRET"
+    credential_url = "https://user:password@rag.example/mcp"
 
     async def failing_executor(*args):
-        raise ConnectionError("RAG unavailable")
+        raise ConnectionError(
+            f"RAG unavailable: {sentinel} {credential_url} case={application.case_id}"
+        )
 
     result = asyncio.run(
         run_credit_assessment(application, decision_executor=failing_executor)
@@ -356,7 +360,21 @@ def test_runner_fails_closed_when_runtime_raises(caplog):
     assert result.risk_level == "undetermined"
     assert result.recommendation == "request_more_information"
     assert result.missing_data == ["rag_or_agent_runtime"]
-    assert "Credit assessment runtime/provenance failure" in caplog.text
+    records = [record for record in caplog.records if record.name == "credit_agent"]
+    assert len(records) == 1
+    assert records[0].getMessage() == (
+        "Credit assessment runtime/provenance failure [ConnectionError]"
+    )
+    assert records[0].exc_info is None
+    assert records[0].exc_text is None
+    for sensitive_value in (
+        sentinel,
+        "RAG unavailable",
+        credential_url,
+        application.case_id,
+        "Traceback",
+    ):
+        assert sensitive_value not in caplog.text
 
 
 def test_mcp_server_allowlist_exposes_only_search_knowledge():

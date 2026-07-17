@@ -509,10 +509,10 @@ async def run_credit_assessment(
             execution.draft,
             execution.trusted_evidence,
         )
-    except Exception:
-        logger.exception(
-            "Credit assessment runtime/provenance failure for case_id=%s",
-            application.case_id,
+    except Exception as error:
+        logger.error(
+            "Credit assessment runtime/provenance failure [%s]",
+            type(error).__name__,
         )
         return fail_closed_assessment(
             application,
