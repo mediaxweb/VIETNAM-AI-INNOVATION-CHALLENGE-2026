@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 from pydantic import ValidationError
 
@@ -9,6 +11,7 @@ from credit_agent import (
     assemble_credit_assessment,
     calculate_credit_metrics,
     fail_closed_assessment,
+    run_credit_assessment,
 )
 
 
@@ -217,3 +220,62 @@ def test_missing_financial_data_fails_closed():
     assert result.risk_level == "undetermined"
     assert result.recommendation == "request_more_information"
     assert result.missing_data == ["monthly_income"]
+
+
+def test_runner_uses_executor_and_returns_assessment():
+    application = personal_application()
+    calls = []
+
+    async def fake_executor(received_application, metrics, mcp_url, model):
+        calls.append((received_application.case_id, mcp_url, model))
+        return valid_draft()
+
+    result = asyncio.run(
+        run_credit_assessment(
+            application,
+            mcp_url="http://rag.test/mcp",
+            model="test-model",
+            decision_executor=fake_executor,
+        )
+    )
+
+    assert calls == [("PERSONAL-001", "http://rag.test/mcp", "test-model")]
+    assert result.risk_level == "low"
+
+
+def test_runner_skips_executor_when_required_financial_data_is_missing():
+    application = LOAN_APPLICATION_ADAPTER.validate_python(
+        {
+            "case_id": "PERSONAL-005",
+            "loan_type": "personal",
+            "requested_amount": "100000000",
+            "term_months": 12,
+            "purpose": "Tiêu dùng",
+            "monthly_debt_payment": "5000000",
+        }
+    )
+
+    async def executor_must_not_run(*args):
+        raise AssertionError("executor should not run")
+
+    result = asyncio.run(
+        run_credit_assessment(application, decision_executor=executor_must_not_run)
+    )
+
+    assert result.risk_level == "undetermined"
+    assert result.missing_data == ["monthly_income"]
+
+
+def test_runner_fails_closed_when_runtime_raises():
+    application = personal_application()
+
+    async def failing_executor(*args):
+        raise ConnectionError("RAG unavailable")
+
+    result = asyncio.run(
+        run_credit_assessment(application, decision_executor=failing_executor)
+    )
+
+    assert result.risk_level == "undetermined"
+    assert result.recommendation == "request_more_information"
+    assert result.missing_data == ["rag_or_agent_runtime"]
