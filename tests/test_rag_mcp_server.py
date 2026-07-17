@@ -349,7 +349,7 @@ def test_fastmcp_page_tool_reads_user_scope_from_environment(monkeypatch):
 def test_loan_data_tools_read_server_user_scope(monkeypatch):
     service = FakeLoanAgentService()
     monkeypatch.setattr(rag_mcp_server, "loan_agent_service", service)
-    monkeypatch.setenv("LOAN_AGENT_MCP_USER_ID", "loan-user")
+    monkeypatch.setenv("LOAN_DATA_MCP_USER_ID", "loan-user")
 
     profile = asyncio.run(rag_mcp_server.get_loan_profile(" profile-1 "))
     customer = asyncio.run(rag_mcp_server.get_customer(" customer-1 "))
@@ -366,16 +366,16 @@ def test_loan_data_tools_read_server_user_scope(monkeypatch):
 
 
 def test_loan_data_tool_fails_without_user_scope(monkeypatch):
-    monkeypatch.delenv("LOAN_AGENT_MCP_USER_ID", raising=False)
+    monkeypatch.delenv("LOAN_DATA_MCP_USER_ID", raising=False)
 
-    with pytest.raises(ValueError, match="LOAN_AGENT_MCP_USER_ID"):
+    with pytest.raises(ValueError, match="LOAN_DATA_MCP_USER_ID"):
         asyncio.run(rag_mcp_server.get_loan_profile("profile-1"))
 
 
 def test_loan_data_tool_redacts_service_error(monkeypatch):
     service = FakeLoanAgentService(error=RuntimeError("secret database detail"))
     monkeypatch.setattr(rag_mcp_server, "loan_agent_service", service)
-    monkeypatch.setenv("LOAN_AGENT_MCP_USER_ID", "loan-user")
+    monkeypatch.setenv("LOAN_DATA_MCP_USER_ID", "loan-user")
 
     with pytest.raises(RuntimeError) as error:
         asyncio.run(rag_mcp_server.get_loan_profile("profile-1"))

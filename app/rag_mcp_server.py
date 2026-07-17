@@ -40,8 +40,8 @@ def _required_text(value: Any, field_name: str) -> str:
 
 def _loan_user_id() -> str:
     return _required_text(
-        os.getenv("LOAN_AGENT_MCP_USER_ID", ""),
-        "LOAN_AGENT_MCP_USER_ID",
+        os.getenv("LOAN_DATA_MCP_USER_ID", ""),
+        "LOAN_DATA_MCP_USER_ID",
     )
 
 

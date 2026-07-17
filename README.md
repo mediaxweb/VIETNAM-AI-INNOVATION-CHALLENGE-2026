@@ -253,7 +253,7 @@ loan cases:
 
 ```powershell
 $env:RAG_MCP_USER_ID="<credit-policy-user-id>"
-$env:LOAN_AGENT_MCP_USER_ID="<loan-api-user-id>"
+$env:LOAN_DATA_MCP_USER_ID="<loan-data-user-id>"
 & '.\.venv\Scripts\python.exe' -m app.rag_mcp_server
 ```
 
