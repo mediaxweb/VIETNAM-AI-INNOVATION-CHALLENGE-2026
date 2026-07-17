@@ -137,3 +137,94 @@ def calculate_credit_metrics(
         missing_data.extend(missing)
 
     return metrics, sorted(set(missing_data))
+
+
+RiskLevel = Literal["low", "medium", "high", "undetermined"]
+Recommendation = Literal[
+    "proceed_to_manual_review",
+    "request_more_information",
+    "escalate_high_risk_review",
+]
+
+
+class KnowledgeEvidence(BaseModel):
+    source_id: str = Field(min_length=1)
+    file_name: str = Field(min_length=1)
+    page: str | None = None
+    excerpt: str = Field(min_length=1)
+
+
+class CreditFinding(BaseModel):
+    summary: str = Field(min_length=1)
+    severity: Literal["info", "warning", "critical"]
+    evidence_ids: list[str] = Field(min_length=1)
+
+
+class CreditDecisionDraft(BaseModel):
+    risk_level: RiskLevel
+    recommendation: Recommendation
+    findings: list[CreditFinding] = Field(default_factory=list)
+    missing_data: list[str] = Field(default_factory=list)
+    evidence: list[KnowledgeEvidence] = Field(default_factory=list)
+
+
+class CreditAssessment(BaseModel):
+    case_id: str
+    loan_type: Literal["personal", "sme"]
+    risk_level: RiskLevel
+    recommendation: Recommendation
+    metrics: list[MetricResult]
+    findings: list[CreditFinding]
+    missing_data: list[str]
+    evidence: list[KnowledgeEvidence]
+
+
+def fail_closed_assessment(
+    application: LoanApplication,
+    metrics: list[MetricResult],
+    missing_data: list[str],
+) -> CreditAssessment:
+    return CreditAssessment(
+        case_id=application.case_id,
+        loan_type=application.loan_type,
+        risk_level="undetermined",
+        recommendation="request_more_information",
+        metrics=metrics,
+        findings=[],
+        missing_data=sorted(set(missing_data)),
+        evidence=[],
+    )
+
+
+def assemble_credit_assessment(
+    application: LoanApplication,
+    metrics: list[MetricResult],
+    missing_data: list[str],
+    draft: CreditDecisionDraft,
+) -> CreditAssessment:
+    combined_missing_data = sorted(set([*missing_data, *draft.missing_data]))
+    if combined_missing_data:
+        return fail_closed_assessment(application, metrics, combined_missing_data)
+    if not draft.evidence:
+        return fail_closed_assessment(application, metrics, ["rag_evidence"])
+
+    available_ids = {item.source_id for item in draft.evidence}
+    referenced_ids = {
+        evidence_id
+        for finding in draft.findings
+        for evidence_id in finding.evidence_ids
+    }
+    unknown_ids = sorted(referenced_ids - available_ids)
+    if unknown_ids:
+        raise ValueError(f"Unknown evidence ids: {', '.join(unknown_ids)}")
+
+    return CreditAssessment(
+        case_id=application.case_id,
+        loan_type=application.loan_type,
+        risk_level=draft.risk_level,
+        recommendation=draft.recommendation,
+        metrics=metrics,
+        findings=draft.findings,
+        missing_data=[],
+        evidence=draft.evidence,
+    )
