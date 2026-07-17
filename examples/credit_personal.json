@@ -1,0 +1,10 @@
+{
+  "case_id": "PERSONAL-DEMO-001",
+  "loan_type": "personal",
+  "requested_amount": "800000000",
+  "term_months": 60,
+  "purpose": "Mua nhà để ở",
+  "monthly_income": "50000000",
+  "monthly_debt_payment": "15000000",
+  "collateral_value": "1000000000"
+}

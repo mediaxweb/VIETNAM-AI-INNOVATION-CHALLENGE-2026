@@ -1,0 +1,14 @@
+{
+  "case_id": "SME-DEMO-001",
+  "loan_type": "sme",
+  "requested_amount": "4000000000",
+  "term_months": 48,
+  "purpose": "Bổ sung vốn lưu động",
+  "annual_net_operating_income": "2400000000",
+  "annual_debt_service": "1200000000",
+  "total_debt": "3000000000",
+  "equity": "2000000000",
+  "current_assets": "1500000000",
+  "current_liabilities": "1000000000",
+  "collateral_value": "5000000000"
+}

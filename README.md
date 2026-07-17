@@ -143,3 +143,33 @@ Optional config:
 export RAGBRAIN_MCP_URL="http://127.0.0.1:8765/mcp"
 export OPENAI_AGENT_MODEL="gpt-5.6"
 ```
+
+## Credit Agent
+
+`agents/credit_agent.py` evaluates normalized personal and SME loan applications.
+It calculates financial ratios in Python, retrieves credit policy evidence from the
+RAG MCP server, and returns a structured recommendation for manual review. It does
+not approve, reject, or update a loan.
+
+The RAG MCP server must expose:
+
+```text
+search_knowledge(domain="credit", query: str, top_k: int = 5)
+```
+
+The RAG corpus contains text documents or PDFs with a text layer. OCR is outside
+this project scope.
+
+Run the personal example:
+
+```powershell
+$env:OPENAI_API_KEY="..."
+$env:RAG_MCP_URL="http://127.0.0.1:8766/mcp"
+& '.\.venv\Scripts\python.exe' agents/credit_agent.py --input examples/credit_personal.json
+```
+
+Run the SME example:
+
+```powershell
+& '.\.venv\Scripts\python.exe' agents/credit_agent.py --input examples/credit_sme.json
+```
