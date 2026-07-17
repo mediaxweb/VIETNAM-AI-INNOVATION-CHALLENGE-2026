@@ -346,3 +346,4 @@ the ingestion request is running.
 ## License
 
 This project is distributed under the [Business Source License 1.1](LICENSE).
+.
